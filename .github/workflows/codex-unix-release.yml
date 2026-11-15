@@ -1,0 +1,259 @@
+name: Codex Unix root2 reviewed signing and release
+on:
+  workflow_dispatch:
+    inputs:
+      release_workflow_sha:
+        description: Exact reviewed current main SHA of THIS public repository
+        required: true
+        type: string
+      source_sha:
+        description: Reviewed private main source SHA
+        required: true
+        type: string
+      source_run_id:
+        description: Successful private root2 unsigned-build run ID, first attempt
+        required: true
+        type: string
+      artifact_id:
+        description: Exact private unsigned artifact ID
+        required: true
+        type: string
+      artifact_sha256:
+        description: Reviewed GitHub artifact archive SHA256
+        required: true
+        type: string
+      installer_sha256:
+        description: Reviewed install.sh SHA256 from unsigned build summary
+        required: true
+        type: string
+      release_tag:
+        description: New vYYYY.MM.DD-codex-unix-root2-N tag; never overwrite
+        required: true
+        type: string
+      publish:
+        description: Owner-approved PUBLIC staging followed by a separate publication gate
+        type: boolean
+        default: false
+      owner_release_approval:
+        description: After explicit owner confirmation only, publish:<tag>:<source_sha>:<artifact_sha256>
+        required: false
+        type: string
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: codex-unix-root2-release
+  cancel-in-progress: false
+env:
+  SOURCE_SHA: ${{ inputs.source_sha }}
+  SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+  ARTIFACT_ID: ${{ inputs.artifact_id }}
+  ARTIFACT_SHA256: ${{ inputs.artifact_sha256 }}
+  INSTALLER_SHA256: ${{ inputs.installer_sha256 }}
+  RELEASE_TAG: ${{ inputs.release_tag }}
+  REVIEWED_WORKFLOW_SHA: ${{ inputs.release_workflow_sha }}
+  REQUEST_PUBLICATION: ${{ inputs.publish && 'true' || 'false' }}
+  OWNER_RELEASE_APPROVAL: ${{ inputs.owner_release_approval }}
+  PUBLIC_KEY_SHA256: ${{ vars.CODEX_ROOT2_PUBLIC_KEY_SHA256 }}
+  GOTOOLCHAIN: local
+  GOWORK: 'off'
+  GOPROXY: 'off'
+  GOSUMDB: 'off'
+jobs:
+  sign:
+    if: github.repository == 'GameRisker/lattice-node-releases' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    environment: codex-unix-sign
+    outputs:
+      package_id: ${{ steps.package.outputs.artifact-id }}
+      package_digest: ${{ steps.package.outputs.artifact-digest }}
+    steps:
+      - name: Validate reviewed identifiers before checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$REVIEWED_WORKFLOW_SHA" = "$GITHUB_SHA"
+          [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$ARTIFACT_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$INSTALLER_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$PUBLIC_KEY_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$RELEASE_TAG" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}-codex-unix-root2-[1-9][0-9]*$ ]]
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.release_workflow_sha }}
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - name: Refuse missing or weakened environment gates
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/codex_release_gate.py --environment codex-unix-sign
+      - name: Validate hosted Go toolchain
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re, subprocess
+          def version(text):
+              match = re.fullmatch(r"(?:go)?(\d+)\.(\d+)(?:\.(\d+))?", text)
+              if not match:
+                  raise SystemExit("Expected a stable Go version, got: " + text)
+              return tuple(int(part or 0) for part in match.groups())
+          required = (1, 25, 0)
+          for module_path in ("codex-signer/go.mod",):
+              for line in pathlib.Path(module_path).read_text().splitlines():
+                  if line.startswith(("go ", "toolchain ")):
+                      required = max(required, version(line.split()[1]))
+          cache = pathlib.Path(os.environ["RUNNER_TOOL_CACHE"]) / "go"
+          candidates = []
+          for executable in cache.glob("*/x64/bin/go"):
+              try:
+                  cached_version = version(executable.parents[2].name)
+              except SystemExit:
+                  continue
+              if cached_version >= required:
+                  candidates.append((cached_version, executable))
+          if not candidates:
+              raise SystemExit(f"No hosted cached Go satisfies {required}; no download or lower-version fallback")
+          # Prefer the lowest sufficient minor line and its newest patch.
+          candidates.sort(key=lambda entry: (entry[0][:2], -entry[0][2]))
+          executable = candidates[0][1]
+          actual_text = subprocess.check_output([str(executable), "env", "GOVERSION"], text=True).strip()
+          actual = version(actual_text)
+          if actual < required:
+              raise SystemExit(f"Hosted Go {actual_text} is below required {required}; no automatic download or fallback")
+          subprocess.run([str(executable), "version"], check=True)
+          with open(os.environ["GITHUB_PATH"], "a") as path_file:
+              path_file.write(str(executable.parent) + "\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(f"Hosted toolchain: {actual_text}; minimum: {required}\n")
+          PY
+      - name: Test and build reviewed public tools (no downloaded programs)
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s scripts -p 'test_*.py' -v
+          cd codex-signer
+          go test ./... -count=1
+          go build -trimpath -buildvcs=false -o "$RUNNER_TEMP/codex-signer" .
+      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        id: reader
+        with:
+          app-id: ${{ vars.LATTICE_ARTIFACT_READER_APP_ID }}
+          private-key: ${{ secrets.LATTICE_ARTIFACT_READER_APP_PRIVATE_KEY }}
+          owner: GameRisker
+          repositories: lattice
+          permission-actions: read
+      - name: Fetch exact immutable source artifact as inert bytes
+        env:
+          GH_TOKEN: ${{ steps.reader.outputs.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/fetch_codex.py --run-id "$SOURCE_RUN_ID" --artifact-id "$ARTIFACT_ID" --source-sha "$SOURCE_SHA" --artifact-sha256 "$ARTIFACT_SHA256" --out "$RUNNER_TEMP/codex-unsigned.zip"
+          chmod 0400 "$RUNNER_TEMP/codex-unsigned.zip"
+      - name: Check archive without access to signing secret
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/codex-signer" --check-archive --archive "$RUNNER_TEMP/codex-unsigned.zip" --archive-sha256 "$ARTIFACT_SHA256" --installer-sha256 "$INSTALLER_SHA256" --public-key-sha256 "$PUBLIC_KEY_SHA256" --tag "$RELEASE_TAG" --source-sha "$SOURCE_SHA" --source-run-id "$SOURCE_RUN_ID"
+      - name: Recheck gate before signing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/codex_release_gate.py --environment codex-unix-sign
+      - name: Sign reviewed bytes in memory (never execute an artifact)
+        env:
+          CODEX_ROOT2_PRIVATE_KEY: ${{ secrets.CODEX_ROOT2_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          "$RUNNER_TEMP/codex-signer" --archive "$RUNNER_TEMP/codex-unsigned.zip" --archive-sha256 "$ARTIFACT_SHA256" --installer-sha256 "$INSTALLER_SHA256" --key-env CODEX_ROOT2_PRIVATE_KEY --public-key-sha256 "$PUBLIC_KEY_SHA256" --tag "$RELEASE_TAG" --source-sha "$SOURCE_SHA" --source-run-id "$SOURCE_RUN_ID" --out "$RUNNER_TEMP/codex-signed"
+      - name: Independent verify, without private key in environment
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/codex-signer" --verify-dir "$RUNNER_TEMP/codex-signed" --archive-sha256 "$ARTIFACT_SHA256" --installer-sha256 "$INSTALLER_SHA256" --public-key-sha256 "$PUBLIC_KEY_SHA256" --tag "$RELEASE_TAG" --source-sha "$SOURCE_SHA" --source-run-id "$SOURCE_RUN_ID"
+          echo 'Signature and package integrity verified. Real root2 installation/model/supervisor upgrade/rollback NOT_RUN. Legacy channel unchanged.' >> "$GITHUB_STEP_SUMMARY"
+      # Approval before this job includes PUBLIC artifact disclosure, not just Release creation.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        id: package
+        if: inputs.publish
+        with:
+          name: codex-unix-root2-signed-${{ github.run_id }}
+          path: ${{ runner.temp }}/codex-signed/*
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 7
+  publish:
+    needs: sign
+    if: inputs.publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: codex-unix-publish
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.release_workflow_sha }}
+          persist-credentials: false
+      - name: Recheck separate owner publication gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/codex_release_gate.py --environment codex-unix-publish
+      - name: Validate hosted Go toolchain
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re, subprocess
+          def version(text):
+              match = re.fullmatch(r"(?:go)?(\d+)\.(\d+)(?:\.(\d+))?", text)
+              if not match:
+                  raise SystemExit("Expected a stable Go version, got: " + text)
+              return tuple(int(part or 0) for part in match.groups())
+          required = (1, 25, 0)
+          for module_path in ("codex-signer/go.mod",):
+              for line in pathlib.Path(module_path).read_text().splitlines():
+                  if line.startswith(("go ", "toolchain ")):
+                      required = max(required, version(line.split()[1]))
+          cache = pathlib.Path(os.environ["RUNNER_TOOL_CACHE"]) / "go"
+          candidates = []
+          for executable in cache.glob("*/x64/bin/go"):
+              try:
+                  cached_version = version(executable.parents[2].name)
+              except SystemExit:
+                  continue
+              if cached_version >= required:
+                  candidates.append((cached_version, executable))
+          if not candidates:
+              raise SystemExit(f"No hosted cached Go satisfies {required}; no download or lower-version fallback")
+          # Prefer the lowest sufficient minor line and its newest patch.
+          candidates.sort(key=lambda entry: (entry[0][:2], -entry[0][2]))
+          executable = candidates[0][1]
+          actual_text = subprocess.check_output([str(executable), "env", "GOVERSION"], text=True).strip()
+          actual = version(actual_text)
+          if actual < required:
+              raise SystemExit(f"Hosted Go {actual_text} is below required {required}; no automatic download or fallback")
+          subprocess.run([str(executable), "version"], check=True)
+          with open(os.environ["GITHUB_PATH"], "a") as path_file:
+              path_file.write(str(executable.parent) + "\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(f"Hosted toolchain: {actual_text}; minimum: {required}\n")
+          PY
+      - name: Build independently reviewed verifier
+        run: |
+          set -euo pipefail
+          cd codex-signer
+          go build -trimpath -buildvcs=false -o "$RUNNER_TEMP/codex-signer" .
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.sign.outputs.package_id }}
+          path: ${{ runner.temp }}/codex-signed
+          merge-multiple: true
+      - name: Verify signatures, exact inventory and owner-approved identity, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/codex_release_gate.py --environment codex-unix-publish
+          "$RUNNER_TEMP/codex-signer" --verify-dir "$RUNNER_TEMP/codex-signed" --archive-sha256 "$ARTIFACT_SHA256" --installer-sha256 "$INSTALLER_SHA256" --public-key-sha256 "$PUBLIC_KEY_SHA256" --tag "$RELEASE_TAG" --source-sha "$SOURCE_SHA" --source-run-id "$SOURCE_RUN_ID" --verified-inventory-out "$RUNNER_TEMP/codex-verified-inventory.json"
+          python3 scripts/publish_codex.py --dir "$RUNNER_TEMP/codex-signed" --tag "$RELEASE_TAG" --source-sha "$SOURCE_SHA" --workflow-sha "$REVIEWED_WORKFLOW_SHA" --verified-inventory "$RUNNER_TEMP/codex-verified-inventory.json"

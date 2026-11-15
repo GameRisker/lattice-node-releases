@@ -1,0 +1,68 @@
+name: Codex release pipeline synthetic tests
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: codex-release-synthetic-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  offline-contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GOTOOLCHAIN: local
+      GOWORK: 'off'
+      GOPROXY: 'off'
+      GOSUMDB: 'off'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Validate hosted Go toolchain
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re, subprocess
+          def version(text):
+              match = re.fullmatch(r"(?:go)?(\d+)\.(\d+)(?:\.(\d+))?", text)
+              if not match:
+                  raise SystemExit("Expected a stable Go version, got: " + text)
+              return tuple(int(part or 0) for part in match.groups())
+          required = (1, 25, 0)
+          for module_path in ("codex-signer/go.mod",):
+              for line in pathlib.Path(module_path).read_text().splitlines():
+                  if line.startswith(("go ", "toolchain ")):
+                      required = max(required, version(line.split()[1]))
+          cache = pathlib.Path(os.environ["RUNNER_TOOL_CACHE"]) / "go"
+          candidates = []
+          for executable in cache.glob("*/x64/bin/go"):
+              try:
+                  cached_version = version(executable.parents[2].name)
+              except SystemExit:
+                  continue
+              if cached_version >= required:
+                  candidates.append((cached_version, executable))
+          if not candidates:
+              raise SystemExit(f"No hosted cached Go satisfies {required}; no download or lower-version fallback")
+          # Prefer the lowest sufficient minor line and its newest patch.
+          candidates.sort(key=lambda entry: (entry[0][:2], -entry[0][2]))
+          executable = candidates[0][1]
+          actual_text = subprocess.check_output([str(executable), "env", "GOVERSION"], text=True).strip()
+          actual = version(actual_text)
+          if actual < required:
+              raise SystemExit(f"Hosted Go {actual_text} is below required {required}; no automatic download or fallback")
+          subprocess.run([str(executable), "version"], check=True)
+          with open(os.environ["GITHUB_PATH"], "a") as path_file:
+              path_file.write(str(executable.parent) + "\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(f"Hosted toolchain: {actual_text}; minimum: {required}\n")
+          PY
+      - name: Test guarded readers, publisher and synthetic signatures only
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s scripts -p 'test_*.py' -v
+          (cd codex-signer && go test ./... -count=1 && go vet ./...)
+          (cd signer && go test ./... -count=1)
+          echo 'Only offline synthetic keys/fixtures. Actual source build, release signing, installation, model execution and production deployment NOT_RUN.' >> "$GITHUB_STEP_SUMMARY"

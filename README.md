@@ -32,3 +32,12 @@
 
 维护者操作说明见 [DEEPSEEK_WINDOWS_PIPELINE.md](DEEPSEEK_WINDOWS_PIPELINE.md)。此目录中的最小签名/发布脚本不包含应用源码；提交脚本不代表 Windows 安装包已发布或通过完整安装验收。此自用通道不替换正式信任根。
 
+
+## Codex Unix root2 (prepared, not activated)
+
+The independent root2 pipeline, owner approval gates, key recovery requirements,
+and acceptance gaps are documented in [docs/CODEX_ROOT2_RELEASE.md](docs/CODEX_ROOT2_RELEASE.md).
+Its code does not configure environments, generate production keys, publish a
+release or replace the legacy/DeepSeek channels. `codex-release-tests.yml` runs
+only synthetic tests; `codex-unix-release.yml` requires explicit manual dispatch
+and reviewed protected environments, with publication disabled by default.
